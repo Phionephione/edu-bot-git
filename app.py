@@ -1,189 +1,150 @@
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify, send_file
-import google.generativeai as genai
 import os
+import random
+import json
+from flask import Flask, render_template, request, redirect, url_for, session, flash
+from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
-from docx import Document
-from io import BytesIO
-import requests
-from bs4 import BeautifulSoup
-from serpapi import GoogleSearch  # Import serpapi
+import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from datetime import timedelta
 
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = "super secret key"
+app.secret_key = os.getenv("SECRET_KEY", "voidspeak_score_edition")
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=20)
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-genai.configure(api_key=GOOGLE_API_KEY)
-model = genai.GenerativeModel('gemini-pro')
+# --- DATABASE ---
+db_url = os.getenv("DATABASE_URL")
+if db_url and db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+app.config['SQLALCHEMY_DATABASE_URI'] = db_url or 'sqlite:///database.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {"connect_args": {"connect_timeout": 10}}
 
-SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
+db = SQLAlchemy(app)
 
-users = {}
+# --- GEMINI CONFIG ---
+AI_KEY = os.getenv("GEMINI_API_KEY")
+if AI_KEY:
+    genai.configure(api_key=AI_KEY)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+else:
+    model = None
 
-# Store the conversation history
-conversation_history = {}
+# --- MODELS ---
+class Confession(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    content = db.Column(db.String(500), nullable=False)
+    author = db.Column(db.String(50), nullable=False)
+    session_id = db.Column(db.String(100), nullable=False)
+    toxicity_score = db.Column(db.Integer, default=0)
+    parent_id = db.Column(db.Integer, db.ForeignKey('confession.id'), nullable=True)
+    replies = db.relationship('Confession', backref=db.backref('parent', remote_side=[id]), lazy=True, cascade="all, delete")
 
+with app.app_context():
+    db.create_all()
 
-@app.route("/", methods=["GET"])
-def index():
-    if 'username' in session:
-        return redirect(url_for('chat'))
-    return redirect(url_for('login'))
+# --- THE SCORING FILTER ---
+def analyze_text(text):
+    msg = text.lower()
+    bad_list = ["fuck", "bitch", "shit", "asshole", "gandu", "bsdk", "loade", "nin ammun", "bolimane"]
+    for word in bad_list:
+        if word in msg:
+            return True, f"AUTO-BLOCK: Extreme Toxicity [{word}]", 10
 
+    if not model: return False, "CLEAN", 0
+    try:
+        s_s = { HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE }
+        prompt = f"""
+        Rate the toxicity of this text on a scale of 0 to 10: '{text}'
+        10 = Extreme hate/profanity, 0 = Safe.
+        Return ONLY JSON: {{"status": "TOXIC" or "CLEAN", "score": integer, "reason": "string"}}
+        """
+        response = model.generate_content(prompt, safety_settings=s_s)
+        data = json.loads(response.text.replace('```json', '').replace('```', '').strip())
+        score = data.get('score', 0)
+        # Block ONLY if 10
+        return (score >= 10), data.get('reason', 'CLEAN'), score
+    except:
+        return False, "CLEAN", 0
 
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    if request.method == "POST":
-        username = request.form.get("username")
-        email = request.form.get("email")
-        password = request.form.get("password")
+# --- ROUTES ---
+@app.route('/')
+def index(): return render_template('index.html')
 
-        if username in users:
-            return render_template("register.html", error="Username already exists")
+@app.route('/about')
+def about(): return render_template('about.html')
 
-        users[username] = {"email": email, "password": password}
-        conversation_history[username] = []
-        return redirect(url_for("login"))
-    return render_template("register.html")
-
-
-@app.route("/login", methods=["GET", "POST"])
+@app.route('/login', methods=['GET', 'POST'])
 def login():
-    if request.method == "POST":
-        username = request.form.get("username")
-        password = request.form.get("password")
+    if request.method == 'POST':
+        adj = ["Epic", "Savage", "Moody", "Salty"]
+        noun = ["Potato", "Wizard", "Ninja", "Taco"]
+        session['username'] = f"{random.choice(adj)}{random.choice(noun)}{random.randint(10, 99)}"
+        session['user_id'] = os.urandom(16).hex()
+        return redirect(url_for('wall'))
+    return render_template('identity.html')
 
-        if username in users and users[username]["password"] == password:
-            session['username'] = username
-            return redirect(url_for("chat"))
+@app.route('/whisper', methods=['GET', 'POST'])
+def whisper():
+    if 'username' not in session: return redirect(url_for('login'))
+    if request.method == 'POST':
+        text = request.form.get('confession')
+        toxic, reason, score = analyze_text(text)
+        if toxic:
+            flash(f"🚫 BLOCKED: Intensity 10/10. Too toxic!", "danger")
+            return render_template('whisper.html', last_text=text)
+        db.session.add(Confession(content=text, author=session['username'], session_id=session['user_id'], toxicity_score=score))
+        db.session.commit()
+        if score >= 7:
+            flash(f"⚠️ Flagged (Intensity: {score}/10). Whisper sent.", "warning")
         else:
-            return render_template("login.html", error="Invalid username or password")
+            flash("Whisper absorbed.", "success")
+        return redirect(url_for('wall'))
+    return render_template('whisper.html')
 
-    return render_template("login.html")
+@app.route('/wall', methods=['GET', 'POST'])
+def wall():
+    if 'username' not in session: return redirect(url_for('login'))
+    if request.method == 'POST':
+        text = request.form.get('confession')
+        p_id = request.form.get('parent_id')
+        toxic, _, score = analyze_text(text)
+        if not toxic:
+            db.session.add(Confession(content=text, author=session['username'], session_id=session['user_id'], parent_id=p_id, toxicity_score=score))
+            db.session.commit()
+        else:
+            flash("🚫 Reply was 10/10 toxic and was blocked.", "danger")
+    posts = Confession.query.filter_by(parent_id=None).order_by(Confession.id.desc()).all()
+    return render_template('wall.html', posts=posts)
 
+@app.route('/my-secrets')
+def profile():
+    if 'user_id' not in session: return redirect(url_for('login'))
+    posts = Confession.query.filter_by(session_id=session['user_id']).all()
+    return render_template('profile.html', posts=posts)
 
-@app.route("/chat", methods=["GET"])
-def chat():
-    if 'username' in session:
-        return render_template("chat.html", name=session['username'])
-    else:
-        return redirect(url_for('login'))
+@app.route('/admin', methods=['GET', 'POST'])
+def admin():
+    if request.method == 'POST' and request.form.get('password') == "admin123":
+        session['is_admin'] = True
+        return redirect(url_for('admin'))
+    posts = Confession.query.order_by(Confession.toxicity_score.desc()).all() if session.get('is_admin') else []
+    return render_template('admin.html', posts=posts)
 
+@app.route('/admin-logout')
+def admin_logout():
+    session.pop('is_admin', None)
+    return redirect(url_for('admin'))
 
-@app.route("/logout")
-def logout():
-    session.pop('username', None)
-    return redirect(url_for("login"))
+@app.route('/delete/<int:id>')
+def delete_post(id):
+    post = Confession.query.get(id)
+    if post and (session.get('is_admin') or post.session_id == session.get('user_id')):
+        db.session.delete(post)
+        db.session.commit()
+    return redirect(request.referrer or url_for('wall'))
 
-def get_reference_links(query, num_links=3):
-    """Searches Google and returns a list of reference links."""
-    try:
-        params = {
-            "engine": "google",
-            "q": query,
-            "api_key": SERPAPI_API_KEY,
-            "num": num_links
-        }
-
-        search = GoogleSearch(params)
-        results = search.get_dict()
-        links = [result["link"] for result in results.get("organic_results", [])]
-        return links
-    except Exception as e:
-        print(f"Error fetching reference links: {e}")
-        return []
-
-
-def get_images(query, num_images=3):
-    """Searches Google Images and returns a list of image URLs."""
-    try:
-        params = {
-            "engine": "google_images",
-            "q": query,
-            "api_key": SERPAPI_API_KEY,
-            "num": num_images
-        }
-
-        search = GoogleSearch(params)
-        results = search.get_dict()
-        images = [result["original"] for result in results.get("images_results", [])]
-        return images
-    except Exception as e:
-        print(f"Error fetching images: {e}")
-        return []
-
-@app.route("/get_response", methods=["POST"])
-def get_response():
-    user_input = request.form["user_input"]
-    username = session['username']
-
-    try:
-        gemini_response = model.generate_content(user_input)
-        answer_text = gemini_response.text
-
-        #Store the response in conversation history without links and images
-        conversation_history[username].append({
-            "question": user_input,
-            "answer": answer_text,
-            "links": [], # Store links as empty list initially
-            "images": [] # Store images as empty list initially
-        })
-        return jsonify({"response": answer_text, "index": len(conversation_history[username]) - 1})  # Return the index
-    except Exception as e:
-        return jsonify({"response": f"Error: {str(e)}"})
-
-@app.route("/get_references", methods=["POST"])
-def get_references():
-    username = session['username']
-    index = int(request.form["index"])
-
-    if 0 <= index < len(conversation_history[username]):
-        question = conversation_history[username][index]["question"]
-        reference_links = get_reference_links(question)
-        image_urls = get_images(question)
-
-        conversation_history[username][index]["links"] = reference_links
-        conversation_history[username][index]["images"] = image_urls
-        return jsonify({"links": reference_links, "images": image_urls})
-    else:
-        return jsonify({"error": "Invalid index"})
-
-
-@app.route("/download_chat")
-def download_chat():
-    username = session['username']
-    history = conversation_history[username]
-
-    document = Document()
-    document.add_heading("Conversation History", 0)
-
-    for item in history:
-        document.add_paragraph(f"Question: {item['question']}")
-        document.add_paragraph(f"Answer: {item['answer']}")
-
-        if item["links"]:
-            document.add_paragraph("References:")
-            for link in item["links"]:
-                document.add_paragraph(link, style='List Bullet')
-
-        document.add_paragraph("")  # Add a blank line between entries
-
-    # Save the document to a BytesIO object
-    doc_io = BytesIO()
-    document.save(doc_io)
-    doc_io.seek(0)  # important to reset the stream position
-
-    return send_file(
-        doc_io,
-        mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        as_attachment=True,
-        download_name=f"conversation_{username}.docx"
-    )
-
-@app.route("/contact")
-def contact():
-    return render_template("contact.html")
-
-if __name__ == "__main__":
-    app.run()
+if __name__ == '__main__':
+    app.run(debug=True)
